@@ -5,10 +5,13 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.community.common.Result;
 import com.community.entity.*;
 import com.community.mapper.*;
+import com.community.service.NotificationService;
 import com.community.service.PaymentBillService;
 import com.community.service.PropertyFeeItemService;
 import com.community.service.SysUserService;
+import com.community.util.RedisLockUtil;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
@@ -16,6 +19,7 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
+@Slf4j
 @RestController
 @RequestMapping("/api/admin/bills")
 @RequiredArgsConstructor
@@ -27,6 +31,11 @@ public class AdminBillController {
     private final CommunityUnitMapper unitMapper;
     private final CommunityBuildingMapper buildingMapper;
     private final ParkingSpaceMapper parkingSpaceMapper;
+    private final RedisLockUtil redisLockUtil;
+    private final NotificationService notificationService;
+
+    /** 账单生成分布式锁 key */
+    private static final String BILL_GENERATE_LOCK = "community:lock:bill:generate:";
 
     // 1. 账单列表查询（支持按项目、状态筛选）
     @GetMapping("/page")
@@ -114,7 +123,7 @@ public class AdminBillController {
         return Result.ok(result);
     }
 
-    // 3. 批量生成账单（房屋/车位维度）
+    // 3. 批量生成账单（房屋/车位维度）—— 分布式锁防止并发重复生成
     @PostMapping("/generate")
     public Result<Void> generateBills(@RequestParam Long feeItemId,
                                       @RequestParam(required = false) String dueDate,
@@ -124,89 +133,110 @@ public class AdminBillController {
         if (item == null) return Result.error(404, "收费项目不存在");
         if (item.getStatus() == 0) return Result.error(400, "该项目已停用，无法生成账单");
 
-        // 截止日期
-        final LocalDate finalDueDate;
-        if (dueDate != null && !dueDate.isBlank()) {
-            finalDueDate = LocalDate.parse(dueDate);
-        } else {
-            int addMonths = 1;
-            if ("QUARTER".equals(item.getCycle())) addMonths = 3;
-            else if ("YEAR".equals(item.getCycle())) addMonths = 12;
-            finalDueDate = LocalDate.now().plusMonths(addMonths);
-        }
+        // 分布式锁：同一费用项目同一时间只允许一个请求生成账单
+        String lockKey = BILL_GENERATE_LOCK + feeItemId;
+        return redisLockUtil.executeWithLock(lockKey, 3000, 30000,
+            "账单正在生成中，请勿重复操作",
+            () -> {
+                // 截止日期
+                final LocalDate finalDueDate;
+                if (dueDate != null && !dueDate.isBlank()) {
+                    finalDueDate = LocalDate.parse(dueDate);
+                } else {
+                    int addMonths = 1;
+                    if ("QUARTER".equals(item.getCycle())) addMonths = 3;
+                    else if ("YEAR".equals(item.getCycle())) addMonths = 12;
+                    finalDueDate = LocalDate.now().plusMonths(addMonths);
+                }
 
-        // 解析目标ID列表
-        final List<Long> ids;
-        if (targetIds != null && !targetIds.isBlank()) {
-            ids = Arrays.stream(targetIds.split(","))
-                    .map(String::trim).map(Long::parseLong).collect(Collectors.toList());
-        } else {
-            ids = Collections.emptyList();
-        }
+                // 解析目标ID列表
+                final List<Long> ids;
+                if (targetIds != null && !targetIds.isBlank()) {
+                    ids = Arrays.stream(targetIds.split(","))
+                            .map(String::trim).map(Long::parseLong).collect(Collectors.toList());
+                } else {
+                    ids = Collections.emptyList();
+                }
 
-        if ("parking".equals(targetType)) {
-            // 车位维度生成
-            List<ParkingSpace> spaces;
-            if (!ids.isEmpty()) {
-                spaces = parkingSpaceMapper.selectBatchIds(ids);
-            } else {
-                spaces = parkingSpaceMapper.selectList(
-                        new LambdaQueryWrapper<ParkingSpace>()
-                                .isNotNull(ParkingSpace::getOwnerId)
-                                .in(ParkingSpace::getStatus, "SOLD", "RESERVED"));
+                int generatedCount = 0;
+                List<Long> notifiedOwnerIds = new ArrayList<>();
+
+                if ("parking".equals(targetType)) {
+                    // 车位维度生成
+                    List<ParkingSpace> spaces;
+                    if (!ids.isEmpty()) {
+                        spaces = parkingSpaceMapper.selectBatchIds(ids);
+                    } else {
+                        spaces = parkingSpaceMapper.selectList(
+                                new LambdaQueryWrapper<ParkingSpace>()
+                                        .isNotNull(ParkingSpace::getOwnerId)
+                                        .in(ParkingSpace::getStatus, "SOLD", "RESERVED"));
+                    }
+                    if (spaces.isEmpty()) return Result.ok(null);
+
+                    // 防重复：查本期已有车位账单
+                    Set<Long> existingParkingIds = billService.list(new LambdaQueryWrapper<PaymentBill>()
+                                    .eq(PaymentBill::getFeeItemId, feeItemId)
+                                    .ge(PaymentBill::getDueDate, LocalDate.now()))
+                            .stream().map(PaymentBill::getParkingSpaceId)
+                            .filter(pid -> pid != null).collect(Collectors.toSet());
+
+                    for (ParkingSpace ps : spaces) {
+                        if (existingParkingIds.contains(ps.getId())) continue;
+                        PaymentBill bill = new PaymentBill();
+                        bill.setOwnerId(ps.getOwnerId());
+                        bill.setParkingSpaceId(ps.getId());
+                        bill.setFeeItemId(feeItemId);
+                        bill.setAmount(item.getAmount());
+                        bill.setStatus("PENDING");
+                        bill.setDueDate(finalDueDate);
+                        bill.setCreateTime(LocalDateTime.now());
+                        billService.save(bill);
+                        generatedCount++;
+                        notifiedOwnerIds.add(ps.getOwnerId());
+                    }
+                } else {
+                    // 房屋维度生成
+                    List<CommunityHouse> houses;
+                    if (!ids.isEmpty()) {
+                        houses = houseMapper.selectBatchIds(ids);
+                    } else {
+                        houses = houseMapper.selectList(
+                                new LambdaQueryWrapper<CommunityHouse>().isNotNull(CommunityHouse::getOwnerId));
+                    }
+                    if (houses.isEmpty()) return Result.ok(null);
+
+                    Set<Long> existingHouseIds = billService.list(new LambdaQueryWrapper<PaymentBill>()
+                                    .eq(PaymentBill::getFeeItemId, feeItemId)
+                                    .ge(PaymentBill::getDueDate, LocalDate.now()))
+                            .stream().map(PaymentBill::getHouseId)
+                            .filter(hid -> hid != null).collect(Collectors.toSet());
+
+                    for (CommunityHouse h : houses) {
+                        if (existingHouseIds.contains(h.getId())) continue;
+                        PaymentBill bill = new PaymentBill();
+                        bill.setOwnerId(h.getOwnerId());
+                        bill.setHouseId(h.getId());
+                        bill.setFeeItemId(feeItemId);
+                        bill.setAmount(item.getAmount());
+                        bill.setStatus("PENDING");
+                        bill.setDueDate(finalDueDate);
+                        bill.setCreateTime(LocalDateTime.now());
+                        billService.save(bill);
+                        generatedCount++;
+                        notifiedOwnerIds.add(h.getOwnerId());
+                    }
+                }
+                log.info("账单批量生成完成 feeItemId={} 生成数={}", feeItemId, generatedCount);
+                // 异步推送站内信通知（不阻塞主链路）
+                if (!notifiedOwnerIds.isEmpty()) {
+                    notificationService.sendBillNotification(
+                            notifiedOwnerIds, item.getItemName(),
+                            item.getAmount(), finalDueDate.toString());
+                }
+                return Result.ok(null);
             }
-            if (spaces.isEmpty()) return Result.ok(null);
-
-            // 防重复：查本期已有车位账单
-            Set<Long> existingParkingIds = billService.list(new LambdaQueryWrapper<PaymentBill>()
-                            .eq(PaymentBill::getFeeItemId, feeItemId)
-                            .ge(PaymentBill::getDueDate, LocalDate.now()))
-                    .stream().map(PaymentBill::getParkingSpaceId)
-                    .filter(pid -> pid != null).collect(Collectors.toSet());
-
-            for (ParkingSpace ps : spaces) {
-                if (existingParkingIds.contains(ps.getId())) continue;
-                PaymentBill bill = new PaymentBill();
-                bill.setOwnerId(ps.getOwnerId());
-                bill.setParkingSpaceId(ps.getId());
-                bill.setFeeItemId(feeItemId);
-                bill.setAmount(item.getAmount());
-                bill.setStatus("PENDING");
-                bill.setDueDate(finalDueDate);
-                bill.setCreateTime(LocalDateTime.now());
-                billService.save(bill);
-            }
-        } else {
-            // 房屋维度生成
-            List<CommunityHouse> houses;
-            if (!ids.isEmpty()) {
-                houses = houseMapper.selectBatchIds(ids);
-            } else {
-                houses = houseMapper.selectList(
-                        new LambdaQueryWrapper<CommunityHouse>().isNotNull(CommunityHouse::getOwnerId));
-            }
-            if (houses.isEmpty()) return Result.ok(null);
-
-            Set<Long> existingHouseIds = billService.list(new LambdaQueryWrapper<PaymentBill>()
-                            .eq(PaymentBill::getFeeItemId, feeItemId)
-                            .ge(PaymentBill::getDueDate, LocalDate.now()))
-                    .stream().map(PaymentBill::getHouseId)
-                    .filter(hid -> hid != null).collect(Collectors.toSet());
-
-            for (CommunityHouse h : houses) {
-                if (existingHouseIds.contains(h.getId())) continue;
-                PaymentBill bill = new PaymentBill();
-                bill.setOwnerId(h.getOwnerId());
-                bill.setHouseId(h.getId());
-                bill.setFeeItemId(feeItemId);
-                bill.setAmount(item.getAmount());
-                bill.setStatus("PENDING");
-                bill.setDueDate(finalDueDate);
-                bill.setCreateTime(LocalDateTime.now());
-                billService.save(bill);
-            }
-        }
-        return Result.ok(null);
+        );
     }
 
     // 4. 手动修改账单状态

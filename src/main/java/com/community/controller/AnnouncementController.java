@@ -5,21 +5,31 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.community.common.Result;
 import com.community.entity.Announcement;
 import com.community.service.AnnouncementService;
+import com.community.util.CacheService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
+@Slf4j
 @RestController
 @RequestMapping("/api/announcement")
 @RequiredArgsConstructor
 public class AnnouncementController {
 
     private final AnnouncementService announcementService;
+    private final CacheService cacheService;
 
     private static final List<String> ALLOWED_TYPES = Arrays.asList("NOTICE", "ACTIVITY", "MAINTENANCE", "OTHER");
+
+    /** 公告列表缓存 key 前缀 */
+    private static final String CACHE_KEY_ANNOUNCEMENTS = "community:announcement:list";
+    /** 公告详情缓存 key 前缀 */
+    private static final String CACHE_KEY_DETAIL = "community:announcement:detail:";
 
     // ======================== 1. 分页查询公告 ========================
     // 业主：只能查看已发布的公告；管理员：可查看全部公告
@@ -56,10 +66,17 @@ public class AnnouncementController {
         return Result.ok(announcementService.selectAnnouncementPageWithPublisher(page, qw));
     }
 
-    // ======================== 2. 查看公告详情 ========================
+    // ======================== 2. 查看公告详情（带缓存）========================
     @GetMapping("/{id}")
     public Result<Announcement> detail(@PathVariable Long id, @RequestAttribute("role") String role) {
-        Announcement announcement = announcementService.getById(id);
+        // 缓存穿透防护：不存在的公告也会缓存空值
+        // 缓存击穿防护：热点公告过期时互斥锁重建
+        String cacheKey = CACHE_KEY_DETAIL + id;
+        Announcement announcement = cacheService.queryWithProtection(
+                cacheKey, Announcement.class,
+                30, TimeUnit.MINUTES,
+                () -> announcementService.getById(id)
+        );
         if (announcement == null) {
             return Result.error(404, "公告不存在");
         }
@@ -94,6 +111,9 @@ public class AnnouncementController {
         announcement.setCreateTime(LocalDateTime.now());
         announcement.setUpdateTime(LocalDateTime.now());
         announcementService.save(announcement);
+        // 公告变更 → 清除公告相关缓存
+        cacheService.evictByPrefix(CACHE_KEY_ANNOUNCEMENTS);
+        cacheService.evictByPrefix(CACHE_KEY_DETAIL);
         return Result.ok(null);
     }
 
@@ -122,6 +142,9 @@ public class AnnouncementController {
         existing.setUpdateTime(LocalDateTime.now());
 
         announcementService.updateById(existing);
+        // 公告变更 → 清除缓存
+        cacheService.evictByPrefix(CACHE_KEY_ANNOUNCEMENTS);
+        cacheService.evictByPrefix(CACHE_KEY_DETAIL);
         return Result.ok(null);
     }
 
@@ -141,6 +164,9 @@ public class AnnouncementController {
         existing.setStatus("WITHDRAWN");
         existing.setUpdateTime(LocalDateTime.now());
         announcementService.updateById(existing);
+        // 公告变更 → 清除缓存
+        cacheService.evictByPrefix(CACHE_KEY_ANNOUNCEMENTS);
+        cacheService.evictByPrefix(CACHE_KEY_DETAIL);
         return Result.ok(null);
     }
 
@@ -155,6 +181,9 @@ public class AnnouncementController {
             return Result.error(404, "公告不存在");
         }
         announcementService.removeById(id);
+        // 公告删除 → 清除缓存
+        cacheService.evictByPrefix(CACHE_KEY_ANNOUNCEMENTS);
+        cacheService.evictByPrefix(CACHE_KEY_DETAIL);
         return Result.ok(null);
     }
 }

@@ -9,7 +9,9 @@ import com.community.entity.SysUser;
 import com.community.service.ParkingSpaceService;
 import com.community.service.CommunityBuildingService;
 import com.community.service.SysUserService;
+import com.community.util.RedisLockUtil;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
@@ -18,6 +20,7 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
+@Slf4j
 @RestController
 @RequestMapping("/api/parking")
 @RequiredArgsConstructor
@@ -25,6 +28,10 @@ public class ParkingSpaceController {
     private final ParkingSpaceService parkingService;
     private final CommunityBuildingService buildingService;
     private final SysUserService userService;
+    private final RedisLockUtil redisLockUtil;
+
+    /** 车位购买分布式锁 key 前缀 */
+    private static final String PARKING_LOCK = "community:lock:parking:buy:";
 
     private static final List<String> ALLOWED_TYPES = Arrays.asList("STANDARD", "COMPACT", "LARGE", "VIP");
     private static final List<String> ALLOWED_STATUS = Arrays.asList("FREE", "LOCKED", "SOLD", "RESERVED");
@@ -207,23 +214,31 @@ public class ParkingSpaceController {
         return Result.ok(result);
     }
 
-    // 2. 业主购买车位
+    // 2. 业主购买车位 —— 分布式锁防超卖
     @PostMapping("/purchase/{id}")
     @Transactional
     public Result<Void> purchase(@PathVariable Long id,
                                  @RequestAttribute("userId") Long ownerId,
                                  @RequestParam(required = false) BigDecimal purchasePrice) {
-        ParkingSpace space = parkingService.getById(id);
-        if (space == null) return Result.error(404, "车位不存在");
-        if (!"FREE".equals(space.getStatus())) return Result.error(400, "车位已被购买或锁定");
+        // 分布式锁：同一车位同一时间只允许一个用户购买
+        String lockKey = PARKING_LOCK + id;
+        return redisLockUtil.executeWithLock(lockKey, 2000, 10000,
+            "车位正在交易中，请稍后重试",
+            () -> {
+                ParkingSpace space = parkingService.getById(id);
+                if (space == null) return Result.error(404, "车位不存在");
+                if (!"FREE".equals(space.getStatus())) return Result.error(400, "车位已被购买或锁定");
 
-        space.setStatus("SOLD");
-        space.setOwnerId(ownerId);
-        space.setPurchasePrice(purchasePrice != null ? purchasePrice : space.getPrice());
-        space.setPurchaseTime(LocalDateTime.now());
-        space.setUpdateTime(LocalDateTime.now());
-        parkingService.updateById(space);
-        return Result.ok(null);
+                space.setStatus("SOLD");
+                space.setOwnerId(ownerId);
+                space.setPurchasePrice(purchasePrice != null ? purchasePrice : space.getPrice());
+                space.setPurchaseTime(LocalDateTime.now());
+                space.setUpdateTime(LocalDateTime.now());
+                parkingService.updateById(space);
+                log.info("车位购买成功 spaceId={} ownerId={}", id, ownerId);
+                return Result.ok(null);
+            }
+        );
     }
 
     // 3. 业主查看已购车位
